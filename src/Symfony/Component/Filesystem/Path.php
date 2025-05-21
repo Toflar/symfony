@@ -28,23 +28,21 @@ use Symfony\Component\Filesystem\Exception\RuntimeException;
 final class Path
 {
     /**
-     * The number of buffer entries that triggers a cleanup operation.
+     * The number of entries that triggers a cleanup operation per cache group.
      */
     private const CLEANUP_THRESHOLD = 1250;
 
     /**
-     * The buffer size after the cleanup operation.
+     * The size after the cleanup operation per cache group.
      */
     private const CLEANUP_SIZE = 1000;
 
     /**
-     * Buffers input/output of {@link canonicalize()}.
+     * The cache array. Contains the data cached by {@link getFromCache()}.
      *
-     * @var array<string, string>
+     * @var array<string, array<string, mixed>>
      */
-    private static array $buffer = [];
-
-    private static int $bufferSize = 0;
+    private static array $cache = [];
 
     /**
      * Canonicalizes the given path.
@@ -69,35 +67,21 @@ final class Path
             return '';
         }
 
-        // This method is called by many other methods in this class. Buffer
-        // the canonicalized paths to make up for the severe performance
-        // decrease.
-        if (isset(self::$buffer[$path])) {
-            return self::$buffer[$path];
-        }
+        return self::getFromCache(__FUNCTION__, $path, static function () use ($path) {
+            // Replace "~" with user's home directory.
+            if ('~' === $path[0]) {
+                $path = self::getHomeDirectory().substr($path, 1);
+            }
 
-        // Replace "~" with user's home directory.
-        if ('~' === $path[0]) {
-            $path = self::getHomeDirectory().substr($path, 1);
-        }
+            $path = self::normalize($path);
 
-        $path = self::normalize($path);
+            [$root, $pathWithoutRoot] = self::split($path);
 
-        [$root, $pathWithoutRoot] = self::split($path);
+            $canonicalParts = self::findCanonicalParts($root, $pathWithoutRoot);
 
-        $canonicalParts = self::findCanonicalParts($root, $pathWithoutRoot);
-
-        // Add the root directory again
-        self::$buffer[$path] = $canonicalPath = $root.implode('/', $canonicalParts);
-        ++self::$bufferSize;
-
-        // Clean up regularly to prevent memory leaks
-        if (self::$bufferSize > self::CLEANUP_THRESHOLD) {
-            self::$buffer = \array_slice(self::$buffer, -self::CLEANUP_SIZE, null, true);
-            self::$bufferSize = self::CLEANUP_SIZE;
-        }
-
-        return $canonicalPath;
+            // Add the root directory again
+            return $root.implode('/', $canonicalParts);
+        });
     }
 
     /**
@@ -772,33 +756,36 @@ final class Path
             return ['', ''];
         }
 
-        // Remember scheme as part of the root, if any
-        if (false !== $schemeSeparatorPosition = strpos($path, '://')) {
-            $root = substr($path, 0, $schemeSeparatorPosition + 3);
-            $path = substr($path, $schemeSeparatorPosition + 3);
-        } else {
-            $root = '';
-        }
+        return self::getFromCache(__FUNCTION__, $path, static function () use ($path) {
 
-        $length = \strlen($path);
-
-        // Remove and remember root directory
-        if (str_starts_with($path, '/')) {
-            $root .= '/';
-            $path = $length > 1 ? substr($path, 1) : '';
-        } elseif ($length > 1 && ctype_alpha($path[0]) && ':' === $path[1]) {
-            if (2 === $length) {
-                // Windows special case: "C:"
-                $root .= $path.'/';
-                $path = '';
-            } elseif ('/' === $path[2]) {
-                // Windows normal case: "C:/"..
-                $root .= substr($path, 0, 3);
-                $path = $length > 3 ? substr($path, 3) : '';
+            // Remember scheme as part of the root, if any
+            if (false !== $schemeSeparatorPosition = strpos($path, '://')) {
+                $root = substr($path, 0, $schemeSeparatorPosition + 3);
+                $path = substr($path, $schemeSeparatorPosition + 3);
+            } else {
+                $root = '';
             }
-        }
 
-        return [$root, $path];
+            $length = \strlen($path);
+
+            // Remove and remember root directory
+            if (str_starts_with($path, '/')) {
+                $root .= '/';
+                $path = $length > 1 ? substr($path, 1) : '';
+            } elseif ($length > 1 && ctype_alpha($path[0]) && ':' === $path[1]) {
+                if (2 === $length) {
+                    // Windows special case: "C:"
+                    $root .= $path.'/';
+                    $path = '';
+                } elseif ('/' === $path[2]) {
+                    // Windows normal case: "C:/"..
+                    $root .= substr($path, 0, 3);
+                    $path = $length > 3 ? substr($path, 3) : '';
+                }
+            }
+
+            return [$root, $path];
+        });
     }
 
     private static function toLower(string $string): string
@@ -812,5 +799,21 @@ final class Path
 
     private function __construct()
     {
+    }
+
+    private static function getFromCache(string $group, string $cacheKey, \Closure $callback): mixed
+    {
+        if (isset(self::$cache[$group][$cacheKey])) {
+            return self::$cache[$group][$cacheKey];
+        }
+
+        self::$cache[$group][$cacheKey] = $callback();
+
+        // Clean up regularly to prevent memory leaks
+        if (\count(self::$cache[$group]) > self::CLEANUP_THRESHOLD) {
+            self::$cache[$group] = \array_slice(self::$cache[$group], -self::CLEANUP_SIZE, null, true);
+        }
+
+        return self::$cache[$group][$cacheKey];
     }
 }
